@@ -1,0 +1,606 @@
+import * as THREE from 'three';
+import { RoundedBoxGeometry } from 'three/addons/geometries/RoundedBoxGeometry.js';
+import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
+import { H, T, RECTS, OPENINGS } from './data.js';
+
+export const solids = [];      // AABB препятствий для коллизий {x0,x1,z0,z1}
+export const segments = [];    // отрезки стен для коллизий [x1,z1,x2,z2]
+export const ceilings = [];    // объекты, скрываемые в режиме обзора
+export const lights = [];
+export const mirrors = [];
+const mirrorM = () => { const m = new THREE.MeshStandardMaterial({ color: '#e8eef0', metalness: 1, roughness: 0.04 }); m.userData.mirror = true; return m; };
+
+const D2R = Math.PI / 180;
+let TX; // текстуры
+const matCache = new Map();
+export function M(color, o = {}) {
+  const key = color + JSON.stringify(o, (k, v) => (v && v.isTexture ? v.uuid : v));
+  if (matCache.has(key)) return matCache.get(key);
+  const m = new THREE.MeshStandardMaterial({ color, roughness: 0.7, metalness: 0, ...o });
+  matCache.set(key, m); return m;
+}
+const chrome = () => M('#d8dadc', { roughness: 0.12, metalness: 1 });
+let _glass; const glassM = () => _glass || (_glass = new THREE.MeshLambertMaterial({ color: '#d6e8ea', transparent: true, opacity: 0.1, depthWrite: false }));
+const whitePaint = () => M('#f2f0ea', { roughness: 0.45 });
+
+// ---------- общие помощники
+function worldUV(geom) {
+  const p = geom.attributes.position, n = geom.attributes.normal; const uv = new Float32Array(p.count * 2);
+  for (let i = 0; i < p.count; i++) {
+    const nx = Math.abs(n.getX(i)), ny = Math.abs(n.getY(i)), nz = Math.abs(n.getZ(i));
+    let u, v; if (ny > 0.5) { u = p.getX(i); v = -p.getZ(i); } else if (nx > nz) { u = p.getZ(i); v = p.getY(i); } else { u = p.getX(i); v = p.getY(i); }
+    uv[i * 2] = u; uv[i * 2 + 1] = v;
+  }
+  geom.setAttribute('uv', new THREE.BufferAttribute(uv, 2)); return geom;
+}
+const archBatches = new Map(); // материал -> геометрии (сливаются в один меш)
+function addArch(matKey, mat, geom) { if (!archBatches.has(matKey)) archBatches.set(matKey, { mat, list: [] }); archBatches.get(matKey).list.push(geom); }
+function boxW(cx, cy, cz, sx, sy, sz) { const g = new THREE.BoxGeometry(sx, sy, sz); g.translate(cx, cy, cz); return worldUV(g); }
+
+export function B(w, h, d, mat, x = 0, y = 0, z = 0, r = 0, parent) {
+  const g = r > 0 ? new RoundedBoxGeometry(w, h, d, 2, Math.min(r, w / 2, h / 2, d / 2)) : new THREE.BoxGeometry(w, h, d);
+  const m = new THREE.Mesh(g, mat); m.position.set(x, y + h / 2, z); m.castShadow = m.receiveShadow = true; if (parent) parent.add(m); return m;
+}
+function Cyl(rt, rb, h, mat, x, y, z, parent, seg = 20) { const m = new THREE.Mesh(new THREE.CylinderGeometry(rt, rb, h, seg), mat); m.position.set(x, y + h / 2, z); m.castShadow = m.receiveShadow = true; if (parent) parent.add(m); return m; }
+function Sph(r, mat, x, y, z, parent, sx = 1, sy = 1, sz = 1) { const m = new THREE.Mesh(new THREE.SphereGeometry(r, 20, 14), mat); m.scale.set(sx, sy, sz); m.position.set(x, y, z); m.castShadow = m.receiveShadow = true; if (parent) parent.add(m); return m; }
+// размещение: x,z — центр, dir — куда смотрит фасад (0 — вверх по плану, 90 — вправо, 180 — вниз, 270 — влево)
+function place(scene, g, x, z, dir = 180, solid = true, y = 0) {
+  g.position.set(x, y, z); g.rotation.y = (180 - dir) * D2R; scene.add(g); g.updateMatrixWorld(true);
+  if (solid) { const b = new THREE.Box3().setFromObject(g); solids.push({ x0: b.min.x, x1: b.max.x, z0: b.min.z, z1: b.max.z }); }
+  return g;
+}
+const inRect = (x, z, pred = () => true) => RECTS.find(r => pred(r) && x > r.x0 && x < r.x1 && z > r.z0 && z < r.z1);
+
+// ---------- архитектура
+function wallMatFor(rect) {
+  const t = TX[rect.wall];
+  return M('#ffffff', { map: t, roughness: rect.wall === 'pvc' ? 0.25 : 0.85 });
+}
+export function buildArchitecture(scene, textures) {
+  TX = textures;
+  const facadeM = M('#d9d2c4', { roughness: 0.95, map: TX.concrete });
+  const slabM = M('#8f8a82', { roughness: 0.95, map: TX.concrete });
+  const baseboardM = M('#6b4024', { roughness: 0.5 });
+  const corniceM = M('#f7f5ef', { roughness: 0.6 });
+
+  for (const r of RECTS) {
+    // пол
+    const fm = M('#ffffff', { map: TX[r.floor], roughness: r.floor === 'tile' ? 0.25 : r.floor === 'parquet' ? 0.35 : 0.55 });
+    addArch('floor_' + r.floor, fm, boxW((r.x0 + r.x1) / 2, -0.01, (r.z0 + r.z1) / 2, r.x1 - r.x0, 0.02, r.z1 - r.z0));
+    // плита перекрытия снизу (видна в режиме обзора)
+    addArch('slab', slabM, boxW((r.x0 + r.x1) / 2, -0.17, (r.z0 + r.z1) / 2, r.x1 - r.x0 + (r.open ? 0 : 0.5), 0.3, r.z1 - r.z0 + (r.open ? 0 : 0.5)));
+    // потолок
+    const cg = new THREE.PlaneGeometry(r.x1 - r.x0, r.z1 - r.z0); cg.rotateX(Math.PI / 2); cg.translate((r.x0 + r.x1) / 2, r.open ? 2.75 : H, (r.z0 + r.z1) / 2);
+    const cm = r.open ? M('#ffffff', { map: TX.concrete, side: THREE.DoubleSide, shadowSide: THREE.DoubleSide }) : M('#ffffff', { map: TX.ceiling, roughness: 0.9, shadowSide: THREE.DoubleSide });
+    const ceil = new THREE.Mesh(worldUV(cg), cm); ceil.castShadow = true; ceil.receiveShadow = true; scene.add(ceil); ceilings.push(ceil);
+    if (r.open) { // открытый балкон: бетонный парапет с перилами
+      const pm = M('#ffffff', { map: TX.concrete, roughness: 0.95 });
+      const rail = M('#3b3b3b', { roughness: 0.5, metalness: 0.6 });
+      const sides = [[r.x0, r.z1, r.x0, r.z0], [r.x0, r.z0, r.x1, r.z0], [r.x1, r.z0, r.x1, r.z1]];
+      for (const [ax, az, bx, bz] of sides) {
+        const len = Math.hypot(bx - ax, bz - az), cx = (ax + bx) / 2, cz = (az + bz) / 2, hor = az === bz;
+        const m = new THREE.Mesh(boxW(cx, 0.5, cz, hor ? len + 0.12 : 0.12, 1.0, hor ? 0.12 : len), pm); m.castShadow = m.receiveShadow = true; scene.add(m);
+        const t = new THREE.Mesh(boxW(cx, 1.03, cz, hor ? len + 0.14 : 0.06, 0.05, hor ? 0.06 : len), rail); t.castShadow = true; scene.add(t);
+        segments.push([ax, az, bx, bz]);
+      }
+      continue;
+    }
+    const wm = wallMatFor(r);
+    const edges = [
+      { o: 'h', at: r.z0, a: r.x0, b: r.x1, inw: 1 }, { o: 'h', at: r.z1, a: r.x0, b: r.x1, inw: -1 },
+      { o: 'v', at: r.x0, a: r.z0, b: r.z1, inw: 1 }, { o: 'v', at: r.x1, a: r.z0, b: r.z1, inw: -1 },
+    ];
+    for (const e of edges) {
+      const ops = OPENINGS.filter(op => op.o === e.o && Math.abs(op.at - e.at) < 0.01 && Math.min(op.b, e.b) - Math.max(op.a, e.a) > 0.01)
+        .map(op => ({ ...op, a: Math.max(op.a, e.a), b: Math.min(op.b, e.b) })).sort((p, q) => p.a - q.a);
+      const pieces = []; let cur = e.a;
+      for (const op of ops) { if (op.a > cur) pieces.push([cur, op.a, 0, H]); if (op.bot > 0) pieces.push([op.a, op.b, 0, op.bot]); if (op.top < H) pieces.push([op.a, op.b, op.top, H]); cur = op.b; }
+      if (cur < e.b) pieces.push([cur, e.b, 0, H]);
+      for (const [a, b, y0, y1] of pieces) {
+        const len = b - a, mid = (a + b) / 2, off = e.at + e.inw * T / 2;
+        const g = e.o === 'h' ? boxW(mid, (y0 + y1) / 2, off, len, y1 - y0, T) : boxW(off, (y0 + y1) / 2, mid, T, y1 - y0, len);
+        addArch('wall_' + r.wall, wm, g);
+        const fo = e.at + e.inw * (T + 0.01);
+        if (y0 === 0) {
+          segments.push(e.o === 'h' ? [a, e.at, b, e.at] : [e.at, a, e.at, b]);
+          if (r.wall !== 'pvc' && y1 > 0.3) addArch('baseboard', baseboardM, e.o === 'h' ? boxW(mid, 0.04, fo, len, 0.08, 0.022) : boxW(fo, 0.04, mid, 0.022, 0.08, len));
+        }
+        if (y1 === H && r.wall !== 'pvc' && r.wall !== 'clap') {
+          const co = e.at + e.inw * (T + 0.02);
+          addArch('cornice', corniceM, e.o === 'h' ? boxW(mid, H - 0.03, co, len, 0.06, 0.04) : boxW(co, H - 0.03, mid, 0.04, 0.06, len));
+        }
+        // фасад снаружи (там, где за стеной нет другого помещения)
+        const step = 0.05; let runA = null;
+        for (let s = a; s <= b + 1e-6; s += step) {
+          const ss = Math.min(s + step / 2, b); const px = e.o === 'h' ? ss : e.at - e.inw * 0.12, pz = e.o === 'h' ? e.at - e.inw * 0.12 : ss;
+          const outside = !inRect(px, pz, rr => !rr.open) && s < b - 1e-6;
+          if (outside && runA === null) runA = s;
+          if ((!outside || s >= b - 1e-6) && runA !== null) {
+            const ra = runA, rb = Math.min(s, b), l = rb - ra, m2 = (ra + rb) / 2, fo2 = e.at - e.inw * 0.15;
+            addArch('facade', facadeM, e.o === 'h' ? boxW(m2, (y0 + y1) / 2 - (y0 === 0 ? 0.15 : 0) + (y1 === H ? 0.15 : 0) / 1, fo2, l + 0.0, y1 - y0 + (y0 === 0 ? 0.3 : 0) + (y1 === H ? 0.3 : 0) - (y0 === 0 && y1 === H ? 0 : 0), 0.3)
+              : boxW(fo2, (y0 + y1) / 2 - (y0 === 0 ? 0.15 : 0) + (y1 === H ? 0.15 : 0), m2, 0.3, y1 - y0 + (y0 === 0 ? 0.3 : 0) + (y1 === H ? 0.3 : 0), l));
+            runA = null;
+          }
+        }
+      }
+    }
+  }
+  for (const [k, { mat, list }] of archBatches) {
+    const m = new THREE.Mesh(mergeGeometries(list), mat); m.castShadow = true; m.receiveShadow = true; m.name = k; scene.add(m);
+  }
+  for (const op of OPENINGS) buildOpening(scene, op);
+}
+
+// ---------- окна и двери
+function onEdge(op, s, y, n) { // точка: s вдоль стены, n — смещение поперёк
+  return op.o === 'h' ? new THREE.Vector3(s, y, op.at + n) : new THREE.Vector3(op.at + n, y, s);
+}
+function insideSign(op) {
+  const mid = (op.a + op.b) / 2;
+  const test = sg => { const p = onEdge(op, mid, 0, sg * 0.3); return inRect(p.x, p.z, r => !r.open); };
+  const p = test(1), m = test(-1);
+  if (p && m) return p.id === 'loggia' ? -1 : 1;
+  return p ? 1 : -1;
+}
+function edgeBox(scene, op, s0, s1, y0, y1, n0, n1, mat, shadow = true) {
+  const a = onEdge(op, s0, y0, n0), b = onEdge(op, s1, y1, n1);
+  const m = new THREE.Mesh(new THREE.BoxGeometry(Math.abs(b.x - a.x) || 0.001, Math.abs(b.y - a.y), Math.abs(b.z - a.z) || 0.001), mat);
+  m.position.set((a.x + b.x) / 2, (a.y + b.y) / 2, (a.z + b.z) / 2); m.castShadow = shadow; m.receiveShadow = true; scene.add(m); return m;
+}
+function frameRect(scene, op, s0, s1, y0, y1, n, fw, depth, mat) {
+  edgeBox(scene, op, s0, s1, y0, y0 + fw, n - depth / 2, n + depth / 2, mat);
+  edgeBox(scene, op, s0, s1, y1 - fw, y1, n - depth / 2, n + depth / 2, mat);
+  edgeBox(scene, op, s0, s0 + fw, y0, y1, n - depth / 2, n + depth / 2, mat);
+  edgeBox(scene, op, s1 - fw, s1, y0, y1, n - depth / 2, n + depth / 2, mat);
+}
+function glassPane(scene, op, s0, s1, y0, y1, n) { const m = edgeBox(scene, op, s0, s1, y0, y1, n - 0.004, n + 0.004, glassM(), false); m.renderOrder = 2; return m; }
+
+function buildOpening(scene, op) {
+  const sg = insideSign(op), inside = sg * (T + 0.0);
+  const casingM = M('#efe9dd', { roughness: 0.45 });
+  if (op.kind === 'window' || op.kind === 'balcdoor') {
+    const fm = whitePaint(); const n = 0, fw = 0.065, dep = 0.08;
+    const { a, b, bot, top } = op;
+    // откосы
+    const revM = M('#efece4', { roughness: 0.8 });
+    edgeBox(scene, op, a, b, top, top + 0.001, -0.25 * sg, sg * T, revM);
+    // рама и створки
+    frameRect(scene, op, a, b, bot, top, n, fw, dep, fm);
+    const panes = op.panes || 1; const pw = (b - a) / panes;
+    for (let i = 1; i < panes; i++) edgeBox(scene, op, a + i * pw - 0.03, a + i * pw + 0.03, bot, top, n - dep / 2, n + dep / 2, fm);
+    if (op.kind === 'balcdoor') {
+      edgeBox(scene, op, a + fw, b - fw, bot, 0.75, n - 0.02, n + 0.02, fm);
+      glassPane(scene, op, a, b, 0.75, top, n);
+    } else {
+      // фрамуги в старых окнах
+      const tr = top - 0.42; if (!op.pvc) edgeBox(scene, op, a, b, tr - 0.03, tr + 0.03, n - dep / 2, n + dep / 2, fm);
+      // ручки
+      for (let i = 0; i < panes; i++) { const h = edgeBox(scene, op, a + i * pw + pw - 0.08, a + i * pw + pw - 0.06, (bot + top) / 2 - 0.08, (bot + top) / 2 + 0.06, sg * 0.045, sg * 0.065, M('#f5f5f5', { roughness: 0.3 })); }
+      glassPane(scene, op, a, b, bot, top, n);
+      // подоконник
+      if (op.bot > 0.3) {
+        edgeBox(scene, op, a - 0.08, b + 0.08, bot - 0.04, bot, n, sg * (T + 0.25), M('#f4f2ec', { roughness: 0.35 }));
+        if (!op.pvc) radiator(scene, op, sg);
+      }
+    }
+    // шторы — только в жилых комнатах и кухне
+    const rm = inRect(onEdge(op, (a + b) / 2, 0, sg * 0.5).x, onEdge(op, (a + b) / 2, 0, sg * 0.5).z);
+    if (rm && ['r1', 'r2', 'r3', 'kitchen'].includes(rm.id) && !(rm.id === 'r3' && op.kind === 'balcdoor')) curtains(scene, op, sg, rm.id);
+    if (rm && rm.id === 'r3' && op.kind === 'balcdoor') curtains(scene, op, sg, rm.id, true);
+    return;
+  }
+  if (op.kind === 'void') return;
+  // дверные наличники с двух сторон
+  const cw = 0.07, { a, b, top } = op;
+  for (const side of [1, -1]) {
+    const nn = side * (T + 0.008);
+    edgeBox(scene, op, a - cw, a, 0, top + cw, nn - 0.008, nn + 0.008, casingM);
+    edgeBox(scene, op, b, b + cw, 0, top + cw, nn - 0.008, nn + 0.008, casingM);
+    edgeBox(scene, op, a - cw, b + cw, top, top + cw, nn - 0.008, nn + 0.008, casingM);
+  }
+  const revM = M('#ece7dc', { roughness: 0.7 });
+  edgeBox(scene, op, a, b, top, top + 0.002, -T, T, revM);
+  if (op.kind === 'arch') return;
+  if (op.kind === 'entry') { // входная дверь, обитая дерматином
+    const leaf = edgeBox(scene, op, a + 0.02, b - 0.02, 0.01, top - 0.01, 0.0, 0.05 * sg, M('#ffffff', { map: TX.padded, roughness: 0.6 }));
+    Sph(0.025, chrome(), ...onEdge(op, b - 0.12, 1.0, 0.08 * sg).toArray());
+    edgeBox(scene, op, b - 0.16, b - 0.08, 1.0, 1.02, 0.06 * sg, 0.1 * sg, chrome());
+    return;
+  }
+  // межкомнатные полотна, открытые настежь
+  const leafDefs = { 'v3.7': ['a', -1, 92], 'h5.3': ['b', 1, 88], 'v8_2.6': ['b', 1, 88] };
+  const key = op.o + op.at + (op.at === 8 ? '_' + op.a : '');
+  if (op.kind === 'glassdouble') {
+    const w = (b - a) / 2;
+    makeLeaf(scene, op, a, w, -1, 82, true); makeLeaf(scene, op, b, -w, -1, 82, true);
+    return;
+  }
+  const d = leafDefs[key]; if (!d) return;
+  const [hinge, side, ang] = d; const w = b - a;
+  makeLeaf(scene, op, hinge === 'a' ? a : b, hinge === 'a' ? w : -w, side, ang, op.at === 5.2);
+}
+function makeLeaf(scene, op, hingeS, w, side, angDeg, glass) {
+  const g = new THREE.Group(); const L = Math.abs(w) - 0.02, Hh = op.top - 0.02;
+  const wood = M('#ffffff', { map: TX.woodMid, roughness: 0.45 });
+  if (glass) {
+    B(L, 0.12, 0.04, wood, L / 2, 0, 0, 0.005, g); B(L, 0.1, 0.04, wood, L / 2, Hh - 0.1, 0, 0.005, g);
+    B(0.1, Hh, 0.04, wood, 0.05, 0, 0, 0.005, g); B(0.1, Hh, 0.04, wood, L - 0.05, 0, 0, 0.005, g);
+    B(L - 0.2, 0.06, 0.04, wood, L / 2, Hh * 0.45, 0, 0.005, g);
+    const gl = new THREE.Mesh(new THREE.BoxGeometry(L - 0.2, Hh - 0.22, 0.006), M('#e8dcc0', { roughness: 0.2, transparent: true, opacity: 0.45 })); gl.position.set(L / 2, Hh / 2 + 0.01, 0); g.add(gl);
+  } else {
+    B(L, Hh, 0.04, wood, L / 2, 0, 0, 0.006, g);
+    for (const yy of [0.25, 1.15]) B(L - 0.2, 0.7, 0.01, M('#ffffff', { map: TX.woodMid, roughness: 0.4, color: '#e8d8c8' }), L / 2, yy, 0.022, 0.004, g);
+  }
+  Cyl(0.02, 0.02, 0.02, M('#c9a24a', { metalness: 1, roughness: 0.3 }), L - 0.07, 1.0, 0.035, g).rotation.x = Math.PI / 2;
+  Cyl(0.02, 0.02, 0.02, M('#c9a24a', { metalness: 1, roughness: 0.3 }), L - 0.07, 1.0, -0.035, g).rotation.x = Math.PI / 2;
+  const sgnW = Math.sign(w);
+  // в локальных координатах полотно лежит вдоль +X от петли; поворачиваем внутрь нужной комнаты
+  const p = onEdge(op, hingeS, 0, 0); g.position.copy(p);
+  let base = op.o === 'h' ? (sgnW > 0 ? 0 : Math.PI) : (sgnW > 0 ? -Math.PI / 2 : Math.PI / 2);
+  // направление открытия
+  const a = angDeg * D2R;
+  const cross = op.o === 'h' ? side * sgnW : -side * sgnW;
+  g.rotation.y = base - cross * a;
+  g.traverse(o => { if (o.isMesh) { o.castShadow = true; o.receiveShadow = true; } });
+  scene.add(g);
+}
+function radiator(scene, op, sg) {
+  const g = new THREE.Group(); const n = Math.max(6, Math.floor((op.b - op.a) * 0.55 / 0.09));
+  const m = M('#f1efe9', { roughness: 0.35 });
+  for (let i = 0; i < n; i++) { B(0.07, 0.55, 0.12, m, i * 0.09, 0, 0, 0.02, g); }
+  Cyl(0.015, 0.015, n * 0.09, m, (n - 1) * 0.09 / 2, -0.015, 0, g).rotation.z = Math.PI / 2;
+  const mid = (op.a + op.b) / 2; const p = onEdge(op, mid, 0.15, sg * (T + 0.1));
+  g.position.set(p.x, 0.15, p.z); if (op.o === 'v') g.rotation.y = Math.PI / 2;
+  g.children.forEach(c => c.position.x -= (n - 1) * 0.09 / 2);
+  scene.add(g);
+}
+function folds(width, height, nf, amp) {
+  const g = new THREE.PlaneGeometry(width, height, nf * 8, 1); const p = g.attributes.position;
+  for (let i = 0; i < p.count; i++) p.setZ(i, Math.sin(p.getX(i) / width * nf * Math.PI * 2) * amp);
+  g.computeVertexNormals(); return g;
+}
+function curtains(scene, op, sg, room, tulleOnly) {
+  const span = op.b - op.a + 0.5, mid = (op.a + op.b) / 2, n = sg * (T + 0.22);
+  const top = H - 0.08, hgt = room === 'kitchen' ? 1.6 : top - 0.02;
+  const rodM = M('#b89a62', { metalness: 0.6, roughness: 0.35 });
+  edgeBox(scene, op, mid - span / 2 - 0.05, mid + span / 2 + 0.05, top, top + 0.03, n - 0.015, n + 0.015, rodM);
+  const tulleM = new THREE.MeshStandardMaterial({ map: TX.tulle, transparent: true, opacity: 0.42, side: THREE.DoubleSide, roughness: 1, depthWrite: false, alphaMap: null });
+  const tt = TX.tulle.clone(); tt.repeat.set(span / 0.2, hgt / 0.2); tt.needsUpdate = true; tulleM.map = tt;
+  const tl = new THREE.Mesh(folds(span, hgt, Math.round(span * 6), 0.025), tulleM); tl.renderOrder = 3;
+  const p = onEdge(op, mid, top - hgt / 2, n - sg * 0.03); tl.position.copy(p); if (op.o === 'v') tl.rotation.y = Math.PI / 2; scene.add(tl);
+  if (tulleOnly || room === 'kitchen') return;
+  const cm = M('#ffffff', { map: TX.curtain, side: THREE.DoubleSide, roughness: 1 });
+  for (const s of [-1, 1]) {
+    const w = 0.55; const c = new THREE.Mesh(folds(w, hgt, 4, 0.05), cm); c.castShadow = true; c.receiveShadow = true;
+    const q = onEdge(op, mid + s * (span / 2 - w / 2 + 0.05), top - hgt / 2, n + sg * 0.03); c.position.copy(q); if (op.o === 'v') c.rotation.y = Math.PI / 2; scene.add(c);
+  }
+}
+
+// ---------- освещение-люстры
+function addLight(scene, x, y, z, intensity = 9, color = '#ffd2a0', dist = 9) {
+  const l = new THREE.PointLight(color, intensity, dist, 2); l.position.set(x, y, z); scene.add(l); lights.push(l); return l;
+}
+const bulbM = () => M('#fff3dc', { emissive: '#ffe2b0', emissiveIntensity: 2.2, roughness: 0.3 });
+function chandelier(scene, x, z, arms = 5, intensity = 10) {
+  const g = new THREE.Group(); const gold = M('#c8a05a', { metalness: 1, roughness: 0.3 });
+  const shade = M('#f6efe0', { roughness: 0.2, transparent: true, opacity: 0.85, emissive: '#ffdcae', emissiveIntensity: 0.9 });
+  Cyl(0.05, 0.05, 0.02, gold, 0, -0.02, 0, g); Cyl(0.008, 0.008, 0.38, gold, 0, -0.4, 0, g);
+  Sph(0.05, gold, 0, -0.42, 0, g);
+  const ring = new THREE.Mesh(new THREE.TorusGeometry(0.26, 0.008, 8, 40), gold); ring.rotation.x = Math.PI / 2; ring.position.y = -0.45; g.add(ring);
+  for (let i = 0; i < arms; i++) {
+    const a = i / arms * Math.PI * 2, cx = Math.cos(a) * 0.26, cz = Math.sin(a) * 0.26;
+    const arm = Cyl(0.006, 0.006, 0.26, gold, cx / 2, -0.43, cz / 2, g); arm.rotation.set(0, -a, Math.PI / 2); arm.position.y = -0.43;
+    const s = new THREE.Mesh(new THREE.CylinderGeometry(0.05, 0.085, 0.13, 18, 1, true), shade); s.position.set(cx, -0.38, cz); g.add(s);
+    Sph(0.03, bulbM(), cx, -0.4, cz, g);
+  }
+  g.position.set(x, H, z); scene.add(g); ceilings.push(g);
+  addLight(scene, x, H - 0.55, z, intensity);
+}
+function pendant(scene, x, z, drop = 0.9, intensity = 4) {
+  const g = new THREE.Group(); Cyl(0.004, 0.004, drop, M('#222'), 0, -drop, 0, g);
+  const sh = new THREE.Mesh(new THREE.ConeGeometry(0.16, 0.18, 24, 1, true), M('#f1e6cf', { side: THREE.DoubleSide, roughness: 0.5, emissive: '#ffdcae', emissiveIntensity: 0.35 }));
+  sh.position.y = -drop - 0.06; g.add(sh); Sph(0.035, bulbM(), 0, -drop - 0.1, 0, g);
+  Cyl(0.04, 0.04, 0.02, M('#f1e6cf'), 0, -0.02, 0, g);
+  g.position.set(x, H, z); scene.add(g); ceilings.push(g);
+  addLight(scene, x, H - drop - 0.15, z, intensity);
+}
+function plafond(scene, x, z, intensity = 5) {
+  const p = Sph(0.15, M('#fff8ea', { emissive: '#ffe7c4', emissiveIntensity: 1.2, roughness: 0.2 }), x, H - 0.05, z, scene, 1, 0.4, 1); ceilings.push(p);
+  addLight(scene, x, H - 0.25, z, intensity);
+}
+
+// ---------- мебель (локальные координаты: фасад смотрит в +Z, центр основания в нуле)
+function sofa(w = 2.0, fab, legsM) {
+  const g = new THREE.Group(); const f = M('#ffffff', { map: fab, roughness: 0.95 }); const d = 0.9;
+  B(w, 0.3, d - 0.2, f, 0, 0.12, 0.08, 0.06, g);                      // основание
+  B(w - 0.36, 0.14, d - 0.3, f, 0, 0.4, 0.12, 0.06, g);               // сиденье
+  B(w - 0.3, 0.55, 0.22, f, 0, 0.4, -d / 2 + 0.13, 0.08, g);          // спинка
+  for (const s of [-1, 1]) B(0.18, 0.62, d - 0.05, f, s * (w / 2 - 0.09), 0.08, 0, 0.07, g); // подлокотники
+  for (let i = 0; i < 3; i++) B((w - 0.42) / 3 - 0.02, 0.32, 0.14, f, -((w - 0.42) / 3) + i * (w - 0.42) / 3, 0.52, -d / 2 + 0.3, 0.06, g).rotation.x = -0.18;
+  for (const sx of [-1, 1]) for (const sz of [-1, 1]) Cyl(0.025, 0.02, 0.12, legsM, sx * (w / 2 - 0.08), 0, sz * (d / 2 - 0.08), g);
+  return g;
+}
+function armchair(fab) {
+  const g = new THREE.Group(); const f = M('#ffffff', { map: fab, roughness: 0.55 });
+  B(0.6, 0.18, 0.62, f, 0, 0.22, 0.04, 0.06, g); B(0.66, 0.62, 0.2, f, 0, 0.2, -0.32, 0.08, g);
+  for (const s of [-1, 1]) B(0.14, 0.55, 0.78, f, s * 0.36, 0.12, 0, 0.06, g);
+  B(0.58, 0.14, 0.6, f, 0, 0.1, 0.04, 0.03, g);
+  for (const sx of [-1, 1]) for (const sz of [-1, 1]) Cyl(0.02, 0.02, 0.12, M('#2b1a10'), sx * 0.36, 0, sz * 0.32, g);
+  return g;
+}
+function bed(w = 1.6, l = 2.05) {
+  const g = new THREE.Group(); const wd = M('#ffffff', { map: TX.woodDark, roughness: 0.35 });
+  B(w + 0.06, 0.32, l, wd, 0, 0.06, 0, 0.02, g);
+  B(w + 0.1, 1.05, 0.06, wd, 0, 0, -l / 2, 0.02, g); B(w + 0.1, 0.55, 0.05, wd, 0, 0, l / 2, 0.02, g);
+  B(w - 0.02, 0.2, l - 0.08, M('#efe9de', { roughness: 0.9 }), 0, 0.38, 0, 0.06, g);
+  B(w + 0.08, 0.06, l - 0.25, M('#ffffff', { map: TX.bedspread, roughness: 0.95 }), 0, 0.56, 0.12, 0.03, g);
+  for (const sz of [-1, 1]) B(w + 0.08, 0.3, 0.02, M('#ffffff', { map: TX.bedspread, roughness: 0.95 }), 0, 0.3, 0, 0, g).position.set(0, 0.47, 0.12 + sz * 0);
+  for (const s of [-1, 1]) B(0.62, 0.14, 0.42, M('#f4ecdd', { roughness: 0.95 }), s * w / 4, 0.57, -l / 2 + 0.3, 0.07, g);
+  return g;
+}
+function nightstand() { const g = new THREE.Group(); const wd = M('#ffffff', { map: TX.woodDark, roughness: 0.35 }); B(0.45, 0.5, 0.4, wd, 0, 0.05, 0, 0.01, g); B(0.4, 0.18, 0.01, wd, 0, 0.35, 0.2, 0, g); Sph(0.012, M('#c9a24a', { metalness: 1, roughness: 0.3 }), 0, 0.44, 0.21, g); for (const sx of [-1, 1]) for (const sz of [-1, 1]) B(0.03, 0.05, 0.03, wd, sx * 0.19, 0, sz * 0.16, 0, g); return g; }
+function lamp(parent, x, y, z) {
+  const g = new THREE.Group(); Cyl(0.06, 0.07, 0.03, M('#c8a05a', { metalness: 1, roughness: 0.3 }), 0, 0, 0, g); Cyl(0.01, 0.01, 0.28, M('#c8a05a', { metalness: 1, roughness: 0.3 }), 0, 0.03, 0, g);
+  const s = new THREE.Mesh(new THREE.CylinderGeometry(0.09, 0.14, 0.18, 20, 1, true), M('#efdcb8', { side: THREE.DoubleSide, emissive: '#ffd9a0', emissiveIntensity: 0.5 })); s.position.y = 0.36; g.add(s);
+  g.position.set(x, y, z); parent.add(g); return g;
+}
+function wardrobe(w, h, d, woodTex, { mirror = false, arched = false, doors = 2 } = {}) {
+  const g = new THREE.Group(); const wd = M('#ffffff', { map: woodTex, roughness: 0.4 });
+  B(w, h - 0.08, d, wd, 0, 0.08, 0, 0.01, g); B(w - 0.04, 0.08, d - 0.04, M('#2a1a10'), 0, 0, 0, 0, g);
+  B(w + 0.04, 0.04, d + 0.03, wd, 0, h - 0.04, 0.01, 0.01, g);
+  const dw = w / doors;
+  for (let i = 0; i < doors; i++) {
+    const cx = -w / 2 + dw * (i + 0.5);
+    B(dw - 0.01, h - 0.14, 0.02, wd, cx, 0.1, d / 2 + 0.005, 0.005, g);
+    if (mirror && (i === Math.floor(doors / 2) || doors === 3 && i === 1)) {
+      const mw = dw - 0.16, mh = h - 0.6;
+      const shape = new THREE.Shape(); shape.moveTo(-mw / 2, 0); shape.lineTo(mw / 2, 0); shape.lineTo(mw / 2, mh - (arched ? mw / 2 : 0));
+      if (arched) shape.absarc(0, mh - mw / 2, mw / 2, 0, Math.PI, false); else shape.lineTo(-mw / 2, mh);
+      shape.lineTo(-mw / 2, 0);
+      const mm = new THREE.Mesh(new THREE.ShapeGeometry(shape, 24), mirrorM());
+      mm.position.set(cx, 0.35, d / 2 + 0.017); g.add(mm);
+    } else {
+      B(dw - 0.14, h - 0.5, 0.012, wd, cx, 0.3, d / 2 + 0.018, 0.004, g);
+    }
+    Cyl(0.008, 0.008, 0.14, M('#c9a24a', { metalness: 1, roughness: 0.3 }), cx + (i % 2 ? -1 : 1) * (dw / 2 - 0.06), 1.0, d / 2 + 0.04, g);
+  }
+  return g;
+}
+function booksRow(parent, w, y, z, h = 0.26) {
+  const t = TX.books.clone(); t.repeat.set(w / 0.9, 1); t.offset.x = Math.random(); t.needsUpdate = true;
+  const m = new THREE.Mesh(new THREE.BoxGeometry(w, h, 0.18), [M('#6b3a2a'), M('#6b3a2a'), M('#e9dfc8'), M('#6b3a2a'), M('#ffffff', { map: t, roughness: 0.8 }), M('#6b3a2a')]);
+  m.position.set(0, y + h / 2, z); m.castShadow = m.receiveShadow = true; parent.add(m); return m;
+}
+function crystal(parent, x, y, z) { const m = M('#ffffff', { roughness: 0.02, transparent: true, opacity: 0.5, envMapIntensity: 3 }); const g = Cyl(0.035, 0.025, 0.12, m, x, y, z, parent, 10); Cyl(0.06, 0.03, 0.08, m, x + 0.12, y, z, parent, 8); return g; }
+function wallUnit(w = 3.3, h = 2.2, d = 0.45) { // советская «стенка»
+  const g = new THREE.Group(); const wd = M('#ffffff', { map: TX.woodDark, roughness: 0.28 }); const sec = w / 4;
+  const handle = M('#c9a24a', { metalness: 1, roughness: 0.3 });
+  for (let i = 0; i < 4; i++) {
+    const cx = -w / 2 + sec * (i + 0.5);
+    if (i === 3) B(sec - 0.01, h, d, wd, cx, 0, 0, 0.005, g);
+    else { B(sec - 0.01, 0.76, d, wd, cx, 0, 0, 0.005, g); B(sec - 0.01, h - 1.84, d, wd, cx, 1.84, 0, 0.005, g); B(0.02, 1.1, d, wd, cx - sec / 2 + 0.015, 0.76, 0, 0, g); B(0.02, 1.1, d, wd, cx + sec / 2 - 0.015, 0.76, 0, 0, g); B(sec - 0.02, 0.02, d, wd, cx, 1.62, 0, 0, g); }
+    // нижние дверцы
+    B(sec - 0.04, 0.68, 0.02, wd, cx, 0.06, d / 2, 0.005, g); Cyl(0.01, 0.01, 0.08, handle, cx + sec / 2 - 0.08, 0.5, d / 2 + 0.025, g);
+    const inner = M('#3a2212', { roughness: 0.6 });
+    if (i === 1) { // ниша под телевизор
+      B(sec - 0.04, 1.1, 0.02, inner, cx, 0.76, -d / 2 + 0.03, 0, g);
+      B(sec - 0.06, 0.73, d - 0.04, inner, cx, 0.79, 0.02, 0, g).visible = false;
+      const tv = new THREE.Group(); B(0.62, 0.45, 0.42, M('#2a2a2a', { roughness: 0.4 }), 0, 0, 0, 0.03, tv);
+      B(0.5, 0.36, 0.01, M('#151a1c', { roughness: 0.1, metalness: 0.2 }), -0.03, 0.05, 0.21, 0.02, tv);
+      tv.position.set(cx, 0.82, 0); g.add(tv);
+      
+    } else if (i === 2 || i === 0) { // стеклянные секции с книгами и хрусталём
+      B(sec - 0.06, 0.02, d - 0.06, wd, cx, 1.18, 0, 0, g);
+      B(sec - 0.04, 1.1, 0.02, M('#3a2414', { roughness: 0.5 }), cx, 0.76, -d / 2 + 0.03, 0, g);
+      const sub = new THREE.Group(); sub.position.x = cx; g.add(sub);
+      if (i === 2) { booksRow(sub, sec - 0.1, 0.78, 0.0); booksRow(sub, sec - 0.1, 1.2, 0.0, 0.3); for (let k = 0; k < 4; k++) crystal(g, cx - 0.3 + k * 0.17, 1.64, 0.05); }
+      else { for (let k = 0; k < 4; k++) { crystal(g, cx - 0.3 + k * 0.17, 0.79, 0.05); crystal(g, cx - 0.3 + k * 0.17, 1.2, 0.05); } booksRow(sub, sec - 0.1, 1.64, 0.0, 0.18); }
+      const gl = B(sec - 0.06, 0.84, 0.008, M('#dfeeee', { roughness: 0.02, transparent: true, opacity: 0.18, envMapIntensity: 2.5, depthWrite: false }), cx, 0.77, d / 2 - 0.01, 0, g); gl.castShadow = false;
+      for (const yy of [0.77, 1.6]) B(sec - 0.04, 0.025, 0.02, wd, cx, yy, d / 2 - 0.005, 0, g); for (const sx of [-1, 1]) B(0.025, 0.85, 0.02, wd, cx + sx * (sec / 2 - 0.03), 0.77, d / 2 - 0.005, 0, g);
+    } else { // закрытый платяной отсек
+      B(sec - 0.04, 1.38, 0.02, wd, cx, 0.76, d / 2, 0.005, g); Cyl(0.01, 0.01, 0.12, handle, cx - sec / 2 + 0.08, 1.2, d / 2 + 0.025, g);
+    }
+    B(sec - 0.04, 0.3, 0.02, wd, cx, 1.88, d / 2, 0.005, g);
+  }
+  B(w + 0.04, 0.04, d + 0.02, wd, 0, h, 0, 0.01, g);
+  return g;
+}
+function bookshelf(w, h, d = 0.32, shelves = 5) {
+  const g = new THREE.Group(); const wd = M('#ffffff', { map: TX.woodMid, roughness: 0.4 });
+  B(0.02, h, d, wd, -w / 2 + 0.01, 0, 0, 0, g); B(0.02, h, d, wd, w / 2 - 0.01, 0, 0, 0, g); B(w, 0.01, d, M('#5a3a20'), 0, 0, -d / 2 + 0.005, 0, g).scale.set(1, h * 100, 0.03);
+  for (let i = 0; i <= shelves; i++) { const y = i * (h - 0.02) / shelves; B(w - 0.04, 0.02, d, wd, 0, y, 0, 0, g); if (i < shelves) booksRow(g, w - 0.06, y + 0.02, 0.0, Math.min(0.3, (h / shelves) - 0.06)); }
+  return g;
+}
+function table(w, d, h, topM, legM, { glass = false } = {}) {
+  const g = new THREE.Group();
+  if (glass) { const t = B(w, 0.012, d, M('#bfe0dc', { roughness: 0.03, transparent: true, opacity: 0.35, envMapIntensity: 2 }), 0, h - 0.012, 0, 0.004, g); t.castShadow = true; }
+  else B(w, 0.035, d, topM, 0, h - 0.035, 0, 0.008, g);
+  for (const sx of [-1, 1]) for (const sz of [-1, 1]) Cyl(0.018, 0.018, h - (glass ? 0.012 : 0.035), legM, sx * (w / 2 - 0.06), 0, sz * (d / 2 - 0.06), g, 12);
+  if (glass) { B(w - 0.08, 0.02, 0.02, legM, 0, h - 0.04, d / 2 - 0.06, 0, g); B(w - 0.08, 0.02, 0.02, legM, 0, h - 0.04, -d / 2 + 0.06, 0, g); }
+  return g;
+}
+function chair(seatM, frameM) {
+  const g = new THREE.Group(); B(0.42, 0.05, 0.42, seatM, 0, 0.42, 0, 0.015, g);
+  for (const sx of [-1, 1]) for (const sz of [-1, 1]) B(0.035, 0.42, 0.035, frameM, sx * 0.18, 0, sz * 0.18, 0.005, g);
+  for (const sx of [-1, 1]) B(0.035, 0.48, 0.035, frameM, sx * 0.18, 0.47, -0.18, 0.005, g);
+  B(0.4, 0.14, 0.025, frameM, 0, 0.76, -0.19, 0.008, g); B(0.4, 0.05, 0.025, frameM, 0, 0.58, -0.19, 0.008, g);
+  return g;
+}
+function rug(scene, x, z, w, l, t, rot = 0) {
+  const m = new THREE.Mesh(new THREE.BoxGeometry(w, 0.012, l), M('#ffffff', { map: t, roughness: 1 })); m.position.set(x, 0.006, z); m.rotation.y = rot; m.receiveShadow = true; scene.add(m);
+}
+function picture(scene, x, y, z, w, h, dir, seed) {
+  const c = document.createElement('canvas'); c.width = 256; c.height = Math.round(256 * h / w); const g2 = c.getContext('2d');
+  const gr = g2.createLinearGradient(0, 0, 0, c.height); gr.addColorStop(0, '#9fb6c9'); gr.addColorStop(0.55, '#e7d6aa'); gr.addColorStop(0.56, '#6c7f45'); gr.addColorStop(1, '#3f4b2a'); g2.fillStyle = gr; g2.fillRect(0, 0, 256, c.height);
+  let s = seed; const r = () => ((s = (s * 9301 + 49297) % 233280) / 233280);
+  for (let i = 0; i < 40; i++) { g2.fillStyle = `hsl(${80 + r() * 50},40%,${20 + r() * 25}%)`; g2.beginPath(); g2.arc(r() * 256, c.height * (0.4 + r() * 0.25), 6 + r() * 18, 0, 7); g2.fill(); }
+  const t = new THREE.CanvasTexture(c); t.colorSpace = THREE.SRGBColorSpace;
+  const grp = new THREE.Group(); B(w + 0.08, h + 0.08, 0.03, M('#8a6a30', { metalness: 0.5, roughness: 0.4 }), 0, -0.04, 0, 0.01, grp);
+  const p = new THREE.Mesh(new THREE.PlaneGeometry(w, h), M('#ffffff', { map: t, roughness: 0.6 })); p.position.set(0, h / 2, 0.016); grp.add(p);
+  grp.position.set(x, y - h / 2, z); grp.rotation.y = (180 - dir) * D2R; scene.add(grp);
+}
+function plant(scene, x, y, z, s = 1) {
+  const g = new THREE.Group(); Cyl(0.11 * s, 0.08 * s, 0.18 * s, M('#a0522d', { roughness: 0.8 }), 0, 0, 0, g);
+  const lm = M('#3f6b2a', { roughness: 0.7 }); for (let i = 0; i < 9; i++) { const a = i * 2.4; Sph(0.1 * s, lm, Math.cos(a) * 0.08 * s, (0.25 + (i % 3) * 0.08) * s, Math.sin(a) * 0.08 * s, g, 1, 0.5, 1.6).rotation.y = a; }
+  g.position.set(x, y, z); scene.add(g);
+}
+
+// ---------- кухня, ванная, туалет
+function kitchenRun(len, withSink, withStove) {
+  const g = new THREE.Group(); const front = M('#ffffff', { map: TX.woodLight, roughness: 0.35 }); const carcass = M('#e9dcc4', { roughness: 0.6 });
+  const top = M('#d8cbb0', { roughness: 0.3, map: TX.linoK }); const handle = chrome();
+  B(len, 0.1, 0.55, M('#3a2a1a'), 0, 0, -0.02, 0, g);
+  B(len, 0.75, 0.56, carcass, 0, 0.1, 0, 0.005, g);
+  B(len + 0.02, 0.035, 0.62, top, 0, 0.85, 0.02, 0.008, g);
+  const nd = Math.round(len / 0.5); const dw = len / nd;
+  for (let i = 0; i < nd; i++) { const cx = -len / 2 + dw * (i + 0.5); B(dw - 0.008, 0.7, 0.02, front, cx, 0.12, 0.29, 0.006, g); B(dw - 0.008, 0.012, 0.022, M('#c2a070'), cx, 0.66, 0.295, 0, g); B(0.12, 0.012, 0.012, handle, cx, 0.75, 0.31, 0.004, g); }
+  // фартук из плитки
+  const tw = TX.tileWall.clone(); tw.repeat.set(len / 0.25, 0.65 / 0.25); tw.needsUpdate = true;
+  const ap = new THREE.Mesh(new THREE.PlaneGeometry(len, 0.62), M('#ffffff', { map: tw, roughness: 0.15 })); ap.position.set(0, 0.885 + 0.31, -0.275); g.add(ap);
+  // навесные шкафы
+  for (let i = 0; i < nd; i++) { const cx = -len / 2 + dw * (i + 0.5); if (withStove && Math.abs(cx - withStove) < 0.3) continue; B(dw - 0.008, 0.7, 0.32, front, cx, 1.55, -0.12, 0.008, g); B(0.012, 0.12, 0.012, handle, cx + dw / 2 - 0.05, 1.6, 0.05, 0.004, g); }
+  if (withSink !== undefined) {
+    const sx = withSink; const st = M('#cfd3d6', { metalness: 0.9, roughness: 0.25 });
+    B(0.5, 0.01, 0.48, st, sx, 0.882, 0.02, 0, g); B(0.4, 0.01, 0.36, M('#9ea3a6', { metalness: 0.9, roughness: 0.3 }), sx - 0.02, 0.888, 0.02, 0, g);
+    const tap = Cyl(0.012, 0.012, 0.28, chrome(), sx, 0.89, -0.2, g); const sp = Cyl(0.01, 0.01, 0.2, chrome(), sx, 1.15, -0.12, g); sp.rotation.x = Math.PI / 2; sp.position.y = 1.16;
+  }
+  if (withStove !== undefined) { // газовая плита «Гефест»
+    const sx = withStove; const wm = M('#f4f4f2', { roughness: 0.25 });
+    B(0.5, 0.85, 0.58, wm, sx, 0, 0.01, 0.01, g); B(0.44, 0.38, 0.01, M('#1c1c1c', { roughness: 0.05 }), sx, 0.2, 0.3, 0.01, g);
+    B(0.4, 0.012, 0.012, chrome(), sx, 0.62, 0.32, 0.004, g);
+    for (const [dx, dz] of [[-0.12, -0.12], [0.12, -0.12], [-0.12, 0.1], [0.12, 0.1]]) { Cyl(0.05, 0.05, 0.012, M('#222', { metalness: 0.6, roughness: 0.4 }), sx + dx, 0.85, dz, g); Cyl(0.035, 0.035, 0.01, M('#555', { metalness: 0.8 }), sx + dx, 0.862, dz, g); }
+    for (let k = 0; k < 4; k++) Cyl(0.02, 0.02, 0.02, M('#333'), sx - 0.15 + k * 0.1, 0.74, 0.3, g).rotation.x = Math.PI / 2;
+    B(0.6, 0.15, 0.48, wm, sx, 1.65, -0.06, 0.02, g); // вытяжка
+  }
+  return g;
+}
+function fridge() { const g = new THREE.Group(); const w = M('#f6f6f3', { roughness: 0.2 }); B(0.6, 1.85, 0.62, w, 0, 0, 0, 0.04, g); B(0.59, 0.005, 0.02, M('#aaa'), 0, 1.25, 0.31, 0, g); B(0.025, 0.3, 0.03, M('#d8d8d8', { roughness: 0.3 }), 0.24, 1.35, 0.32, 0.01, g); B(0.025, 0.25, 0.03, M('#d8d8d8', { roughness: 0.3 }), 0.24, 0.85, 0.32, 0.01, g); return g; }
+function bathTub() {
+  const g = new THREE.Group(); const en = M('#fbfbfa', { roughness: 0.12 });
+  const len = 1.7, w = 0.72, h = 0.58;
+  B(len, h - 0.05, w, en, 0, 0.05, 0, 0.06, g);
+  const inner = new THREE.Mesh(new RoundedBoxGeometry(len - 0.14, 0.42, w - 0.14, 3, 0.12), M('#eef0f0', { roughness: 0.08 })); inner.position.set(0, h - 0.18, 0); g.add(inner);
+  B(len - 0.12, 0.002, w - 0.12, M('#e7ecee', { roughness: 0.05 }), 0, h - 0.001, 0, 0, g).visible = false;
+  const tap = Cyl(0.012, 0.012, 0.2, chrome(), -len / 2 + 0.1, h + 0.18, -w / 2 - 0.02, g); tap.rotation.x = Math.PI / 2; tap.position.z = -w / 2 + 0.05;
+  B(0.18, 0.04, 0.04, chrome(), -len / 2 + 0.1, h + 0.18, -w / 2 + 0.0, 0.01, g);
+  Cyl(0.008, 0.008, 1.1, chrome(), -len / 2 + 0.06, h + 0.2, -w / 2 + 0.0, g);
+  Cyl(0.035, 0.02, 0.18, chrome(), -len / 2 + 0.06, h + 1.25, -w / 2 + 0.06, g).rotation.x = 0.5;
+  // штора для ванной
+  const rod = Cyl(0.01, 0.01, len, chrome(), 0, 1.95, w / 2 - 0.02, g); rod.rotation.z = Math.PI / 2; rod.position.y = 1.95;
+  const cm = new THREE.Mesh(folds(0.3, 1.35, 3, 0.05), M('#bcd6e8', { side: THREE.DoubleSide, roughness: 0.6, transparent: true, opacity: 0.9 })); cm.position.set(len / 2 - 0.15, 1.27, w / 2 - 0.02); g.add(cm);
+  return g;
+}
+function washer() { const g = new THREE.Group(); const w = M('#f5f5f3', { roughness: 0.25 }); B(0.6, 0.85, 0.5, w, 0, 0, 0, 0.03, g); const r = new THREE.Mesh(new THREE.TorusGeometry(0.17, 0.03, 12, 32), M('#c9cdd0', { metalness: 0.8, roughness: 0.25 })); r.position.set(0, 0.42, 0.255); g.add(r); const d = new THREE.Mesh(new THREE.CircleGeometry(0.16, 32), M('#5b7380', { roughness: 0.05, transparent: true, opacity: 0.8 })); d.position.set(0, 0.42, 0.252); g.add(d); B(0.56, 0.1, 0.01, M('#e0e0e0'), 0, 0.72, 0.25, 0.005, g); Cyl(0.02, 0.02, 0.02, M('#999'), 0.18, 0.77, 0.26, g).rotation.x = Math.PI / 2; return g; }
+function sink() { const g = new THREE.Group(); const c = M('#fbfbfa', { roughness: 0.12 }); B(0.55, 0.16, 0.42, c, 0, 0.7, 0, 0.06, g); Cyl(0.1, 0.07, 0.7, c, 0, 0, -0.05, g); B(0.42, 0.02, 0.28, M('#eef0f0', { roughness: 0.05 }), 0, 0.855, 0.02, 0.01, g); Cyl(0.012, 0.012, 0.18, chrome(), 0, 0.86, -0.15, g); const sp = Cyl(0.01, 0.01, 0.12, chrome(), 0, 1.02, -0.1, g); sp.rotation.x = Math.PI / 2; sp.position.y = 1.03;
+  B(0.5, 0.65, 0.12, M('#f7f7f5', { roughness: 0.3 }), 0, 1.2, -0.15, 0.01, g); B(0.44, 0.58, 0.005, mirrorM(), 0, 1.24, -0.088, 0, g); B(0.5, 0.02, 0.12, M('#fff'), 0, 1.15, -0.13, 0.005, g); return g; }
+function toilet() { const g = new THREE.Group(); const c = M('#fbfbfa', { roughness: 0.12 }); Cyl(0.13, 0.1, 0.38, c, 0, 0, 0.08, g); Sph(0.19, c, 0, 0.38, 0.12, g, 1, 0.3, 1.25); B(0.38, 0.02, 0.46, M('#f0f0ee', { roughness: 0.2 }), 0, 0.42, 0.12, 0.08, g); B(0.42, 0.36, 0.17, c, 0, 0.45, -0.2, 0.04, g); B(0.44, 0.03, 0.19, c, 0, 0.81, -0.2, 0.01, g); Cyl(0.015, 0.015, 0.02, chrome(), 0, 0.84, -0.2, g); return g; }
+function pipes(scene, x, z) { const m = M('#e6e3dc', { roughness: 0.4 }); Cyl(0.055, 0.055, H, m, x, 0, z, scene); Cyl(0.02, 0.02, H, M('#b0b0aa', { metalness: 0.6, roughness: 0.4 }), x + 0.12, 0, z, scene); Cyl(0.02, 0.02, H, M('#b0b0aa', { metalness: 0.6, roughness: 0.4 }), x + 0.18, 0, z, scene); }
+function towelRail(scene, x, y, z, dir) { const g = new THREE.Group(); const c = chrome(); for (const s of [-1, 1]) { Cyl(0.012, 0.012, 0.5, c, s * 0.2, 0, 0, g); } for (let i = 0; i < 3; i++) Cyl(0.01, 0.01, 0.4, c, 0, 0.1 + i * 0.15, 0, g).rotation.z = Math.PI / 2; g.children.slice(2).forEach((m, i) => m.position.set(0, 0.1 + i * 0.15, 0)); g.position.set(x, y, z); g.rotation.y = (180 - dir) * D2R; scene.add(g); }
+
+// ---------- расстановка мебели по помещениям
+export function buildFurniture(scene) {
+  const wdDark = M('#ffffff', { map: TX.woodDark, roughness: 0.3 });
+  const legs = M('#3a2414', { roughness: 0.4 });
+  // === Большая комната 18,9
+  place(scene, wallUnit(3.4, 2.2, 0.45), 2.05, 4.5 - T - 0.24, 0);
+  place(scene, sofa(2.1, TX.fabricBeige, legs), T + 0.47, 2.3, 90);
+  place(scene, armchair(TX.fabricBeige), 3.4, 1.0, 225);
+  const ct = place(scene, table(1.0, 0.6, 0.45, wdDark, legs), 1.75, 2.3, 90);
+  plant(scene, 1.75, 0.45, 2.3, 0.7);
+  rug(scene, 1.95, 2.3, 2.0, 3.0, TX.rug(5));
+  chandelier(scene, 2.1, 2.2, 5, 12);
+  picture(scene, T + 0.01, 1.9, 2.3, 0.8, 0.55, 90, 3);
+  // === Холл 7,5
+  place(scene, bookshelf(1.1, 2.2, 0.32, 6), 6.7 - T - 0.17, 3.9, 270);
+  place(scene, bookshelf(0.75, 2.0, 0.3, 5), 4.2 + T + 0.16, 1.98, 90);
+  place(scene, armchair(TX.leather), 4.75, 4.05, 45);
+  plant(scene, 4.45, 0, 4.45, 1.3);
+  rug(scene, 5.45, 3.0, 1.2, 2.0, TX.rug(9, '#5a2a1e', '#c9a46a', '#2c2a3a'));
+  const shoe = new THREE.Group(); B(0.8, 0.45, 0.32, M('#ffffff', { map: TX.woodMid, roughness: 0.4 }), 0, 0, 0, 0.01, shoe); place(scene, shoe, 6.15, 1.5 + T + 0.17, 180);
+  plafond(scene, 5.45, 2.4, 6); plafond(scene, 5.2, 4.85, 3);
+  { const mir = new THREE.Mesh(new THREE.PlaneGeometry(0.6, 0.9), mirrorM()); mir.position.set(6.15, 1.45, 1.5 + T + 0.01); scene.add(mir);
+    B(0.66, 0.96, 0.02, M('#8a6a30', { metalness: 0.5, roughness: 0.4 }), 6.15, 1.0, 1.5 + T + 0.002, 0.01, scene); mir.position.z += 0.012; }
+  picture(scene, 4.2 + T + 0.01, 1.8, 4.0, 0.5, 0.4, 90, 7);
+  // === Коридор 4,8 (шкаф с арочным зеркалом)
+  place(scene, wardrobe(1.5, 2.3, 0.42, TX.woodLight, { mirror: true, arched: true, doors: 3 }), 6.7 + T + 0.22, 4.35, 90);
+  for (let i = 0; i < 4; i++) Sph(0.02, M('#c9a24a', { metalness: 1, roughness: 0.3 }), 6.82 + 0.0, 1.65, 1.75 + i * 0.12, scene);
+  plafond(scene, 7.35, 3.2, 6);
+  // === Ванная 3,9
+  place(scene, bathTub(), 10.2 - T - 0.37, 2.38, 270);
+  place(scene, washer(), 9.05, 3.27 - T - 0.27, 0);
+  place(scene, sink(), 8.95, 1.5 + T + 0.22, 180);
+  towelRail(scene, 8.0 + T + 0.02, 1.2, 2.25, 90);
+  plafond(scene, 9.1, 2.4, 5);
+  { const sh = new THREE.Group(); B(0.6, 0.02, 0.18, M('#f4f4f2', { roughness: 0.2 }), 0, 0, 0, 0.005, sh);
+    const cols = ['#2f7fb5', '#e9e3d6', '#d9534f', '#7bbf6a', '#f0c040']; cols.forEach((c, i) => Cyl(0.03, 0.03, 0.14 + (i % 2) * 0.06, M(c, { roughness: 0.3 }), -0.22 + i * 0.11, 0.02, 0, sh, 12));
+    place(scene, sh, 9.05, 3.27 - T - 0.1, 0, false, 1.25); }
+  { const tw = new THREE.Mesh(new THREE.BoxGeometry(0.02, 0.45, 0.35), M('#7fa6c9', { roughness: 1 })); tw.position.set(8.0 + T + 0.05, 1.05, 2.25); tw.castShadow = true; scene.add(tw); }
+  { const mat = new THREE.Mesh(new RoundedBoxGeometry(0.5, 0.012, 0.8, 2, 0.005), M('#6f9bbf', { roughness: 1 })); mat.position.set(9.4, 0.006, 2.4); scene.add(mat); }
+  // === Туалет
+  place(scene, toilet(), 9.2 - T - 0.3, 3.9, 270);
+  pipes(scene, 9.2 - T - 0.08, 3.37 + 0.02);
+  { const sh = new THREE.Group(); B(0.9, 0.02, 0.25, M('#f4f4f2'), 0, 0, 0, 0.005, sh); place(scene, sh, 8.6, 4.5 - T - 0.13, 0, false, 1.8); }
+  plafond(scene, 8.6, 3.9, 3);
+  // === Кухня 10,0
+  place(scene, kitchenRun(2.4, 0.55, -0.55), 9.6 - T - 0.31, 6.45, 270);
+  { const g = kitchenRun(1.0); place(scene, g, 8.6, 5.2 + T + 0.31, 180); }
+  place(scene, fridge(), 6.7 + T + 0.32, 6.75, 90);
+  place(scene, table(1.0, 0.65, 0.75, null, chrome(), { glass: true }), 7.9, 7.75, 180);
+  const seat = M('#ffffff', { map: TX.woodLight, roughness: 0.4 }); const fr = M('#ffffff', { map: TX.woodLight, roughness: 0.4, color: '#c9a77a' });
+  place(scene, chair(seat, fr), 7.15, 7.8, 90); place(scene, chair(seat, fr), 7.9, 7.1, 180 + 180); place(scene, chair(seat, fr), 8.65, 7.8, 270);
+  pendant(scene, 7.7, 7.75, 0.95, 5); pendant(scene, 8.1, 7.75, 0.95, 5);
+  plafond(scene, 8.2, 6.2, 5);
+  { const fruits = new THREE.Group(); Cyl(0.13, 0.08, 0.06, M('#f0efe9', { roughness: 0.2 }), 0, 0, 0, fruits); for (let i = 0; i < 5; i++) Sph(0.035, M(['#d23a2a', '#e8b020', '#7aa83a'][i % 3], { roughness: 0.4 }), Math.cos(i) * 0.06, 0.07, Math.sin(i) * 0.06, fruits); fruits.position.set(7.9, 0.76, 7.75); scene.add(fruits); }
+  plant(scene, 8.7, 0.8, 8.65 - T - 0.15, 0.6);
+  // === Спальня 14,8
+  place(scene, bed(1.6, 2.05), T + 1.06, 6.6, 90);
+  place(scene, nightstand(), T + 0.24, 5.4, 90); place(scene, nightstand(), T + 0.24, 7.8, 90);
+  lamp(scene, T + 0.24, 0.55, 5.4); lamp(scene, T + 0.24, 0.55, 7.8);
+  place(scene, wardrobe(1.6, 2.2, 0.58, TX.woodDark, { mirror: true, doors: 3 }), 1.5, 4.5 + T + 0.3, 180);
+  { const dr = new THREE.Group(); B(1.1, 0.85, 0.48, wdDark, 0, 0, 0, 0.01, dr); for (let i = 0; i < 3; i++) { B(1.04, 0.24, 0.02, wdDark, 0, 0.06 + i * 0.26, 0.24, 0.005, dr); B(0.16, 0.015, 0.02, M('#c9a24a', { metalness: 1, roughness: 0.3 }), 0, 0.18 + i * 0.26, 0.26, 0.004, dr); }
+    place(scene, dr, 3.7 - T - 0.25, 6.9, 270); const mir = new THREE.Mesh(new THREE.PlaneGeometry(0.7, 0.9), mirrorM()); mir.position.set(3.7 - T - 0.005, 1.5, 6.9); mir.rotation.y = -Math.PI / 2; scene.add(mir); }
+  rug(scene, 2.4, 6.6, 1.4, 2.2, TX.rug(13, '#6e1c22', '#d4b37c', '#22304a'));
+  chandelier(scene, 1.85, 6.5, 5, 10);
+  picture(scene, T + 0.01, 1.75, 6.6, 0.9, 0.5, 90, 11);
+  // === Комната 11,1
+  place(scene, sofa(1.95, TX.fabricGreen, legs), 3.7 + T + 0.47, 7.0, 90);
+  place(scene, wardrobe(1.2, 2.2, 0.55, TX.woodDark, { doors: 2 }), 6.7 - T - 0.29, 6.0, 270);
+  { const desk = table(1.1, 0.6, 0.75, wdDark, legs); place(scene, desk, 6.7 - T - 0.32, 7.8, 270); place(scene, chair(M('#ffffff', { map: TX.fabricBeige }), wdDark), 6.0, 7.8, 90); lamp(scene, 6.4, 0.75, 7.5); }
+  rug(scene, 5.1, 7.1, 1.6, 2.2, TX.rug(17, '#7a2b20', '#e0c08a', '#2a3a5a'));
+  chandelier(scene, 5.2, 7.1, 3, 9);
+  picture(scene, 3.7 + T + 0.01, 1.8, 7.0, 0.7, 0.5, 90, 5);
+  // === Лоджия
+  place(scene, table(0.6, 0.6, 0.65, M('#ffffff', { map: TX.woodMid }), M('#ffffff', { map: TX.woodMid })), 5.7, 9.8, 180);
+  const lwood = M('#ffffff', { map: TX.woodMid, roughness: 0.5 });
+  place(scene, chair(lwood, lwood), 5.1, 9.85, 90); place(scene, chair(lwood, lwood), 6.35, 9.85, 270);
+  plant(scene, 4.1, 0, 10.2, 1.2); plant(scene, 6.6, 1.0, 10.4, 0.6);
+  plafond(scene, 5.3, 9.75, 3);
+  // === Балкон — только бельевые верёвки
+  for (let i = 0; i < 3; i++) { const l = Cyl(0.003, 0.003, 3.2, M('#ddd'), 2.1, 2.45, -0.3 - i * 0.3, scene); l.rotation.z = Math.PI / 2; l.position.y = 2.45; }
+}
+
+// ---------- окружение: двор, деревья, гаражи, соседние дома и панорама
+export function buildOutside(scene, panoTex) {
+  const ground = new THREE.Mesh(new THREE.PlaneGeometry(300, 300), M('#6f7d4a', { roughness: 1 })); ground.rotation.x = -Math.PI / 2; ground.position.y = -12; ground.receiveShadow = true; scene.add(ground);
+  const asphalt = new THREE.Mesh(new THREE.PlaneGeometry(60, 10), M('#56575a', { roughness: 0.95 })); asphalt.rotation.x = -Math.PI / 2; asphalt.position.set(5, -11.98, 22); scene.add(asphalt);
+  // фасад дома ниже и выше квартиры
+  const facade = M('#d9d2c4', { roughness: 0.95, map: TX.concrete });
+  for (const y of [-6.0, 7.2]) { const m = new THREE.Mesh(new THREE.BoxGeometry(11.2, y < 0 ? 11.7 : 9, 12.2), facade); m.position.set(5.0, y < 0 ? -6.15 : 2.86 + 4.5, 4.6); m.receiveShadow = true; m.castShadow = y > 0; m.userData.upper = y > 0; scene.add(m); if (y > 0) ceilings.push(m); }
+  const r = (() => { let s = 42; return () => ((s = (s * 16807) % 2147483647) / 2147483647); })();
+  const trunk = M('#4a3a2a'); const leafs = [M('#4f6e2e', { roughness: 0.9 }), M('#5e7c34', { roughness: 0.9 }), M('#3e5a26', { roughness: 0.9 })];
+  for (let i = 0; i < 46; i++) {
+    let x = -25 + r() * 60, z = -25 + r() * 60; if (x > -4 && x < 14 && z > -6 && z < 14) continue;
+    const h = 8 + r() * 8; const t = Cyl(0.18, 0.28, h * 0.5, trunk, x, -12, z, scene, 8);
+    for (let k = 0; k < 4; k++) Sph(1.6 + r() * 1.6, leafs[k % 3], x + (r() - 0.5) * 2, -12 + h * 0.55 + k * 1.1, z + (r() - 0.5) * 2, scene, 1, 1.1, 1);
+  }
+  // ряд гаражей во дворе
+  for (let i = 0; i < 12; i++) { const g = B(3, 2.4, 6, M(['#7b6f60', '#8a7f72', '#6f6658'][i % 3], { roughness: 0.9 }), -12 + i * 3.1, -12, 26, 0, scene); B(2.4, 2.0, 0.05, M(['#4f6d7a', '#7a4f3a', '#5a6a4a', '#8a8a80'][i % 4], { roughness: 0.6, metalness: 0.4 }), -12 + i * 3.1, -12, 22.98, 0, scene); }
+  for (let i = 0; i < 10; i++) { const g = B(3, 2.4, 6, M('#7d7468', { roughness: 0.9 }), -12 + i * 3.1, -12, -18, 0, scene); }
+  // соседние дома
+  const mk = (x, z, w, d, h, col, stripe) => { const m = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), M(col, { roughness: 0.9 })); m.position.set(x, -12 + h / 2, z); m.castShadow = true; scene.add(m); };
+  mk(-30, 40, 14, 14, 50, '#e8e1d6'); mk(-8, 55, 40, 14, 48, '#e19a5a'); mk(35, 45, 14, 14, 55, '#ece6dc'); mk(42, -30, 14, 30, 40, '#b8664a'); mk(-35, -35, 16, 16, 52, '#a35a3e'); mk(10, -50, 50, 14, 36, '#ddd5c8');
+  // панорама — большой цилиндр вокруг (неосвещённый материал, яркий как дневной свет)
+  const cyl = new THREE.Mesh(new THREE.CylinderGeometry(140, 140, 140, 64, 1, true), new THREE.MeshBasicMaterial({ map: panoTex, side: THREE.BackSide, toneMapped: false, fog: false }));
+  cyl.position.set(5, 18, 5); scene.add(cyl);
+  return cyl;
+}

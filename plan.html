@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Фото на планировке — 3-комнатная квартира 75,2 м²</title>
+<style>
+*{box-sizing:border-box}body{margin:0;font:15px/1.4 -apple-system,"Segoe UI",Roboto,Arial,sans-serif;background:#f4f1ec;color:#222}
+header{padding:16px 20px;background:#1f2226;color:#fff;display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap}
+header a{color:#fff;background:#ff7a1a;padding:8px 14px;border-radius:10px;text-decoration:none}
+main{display:grid;grid-template-columns:minmax(300px,1.1fr) 1fr;gap:20px;padding:20px;max-width:1300px;margin:auto}
+@media(max-width:850px){main{grid-template-columns:1fr}}
+.card{background:#fff;border-radius:14px;padding:14px;box-shadow:0 2px 12px rgba(0,0,0,.06)}
+svg{width:100%;display:block}
+rect.room,polygon.room{fill:#fbf7ef;stroke:#333;stroke-width:.14}rect.room.open{fill:#eef2f4;stroke-dasharray:.2 .12}
+text.rn{font-size:.36px;text-anchor:middle;fill:#444}text.ra{font-size:.42px;text-anchor:middle;fill:#c25a10;font-weight:700}
+.pin{cursor:pointer}.pin path{fill:rgba(255,122,26,.35);stroke:#ff7a1a;stroke-width:.04}.pin circle{fill:#ff7a1a;stroke:#fff;stroke-width:.06}.pin text{font-size:.3px;fill:#fff;text-anchor:middle;font-weight:700;pointer-events:none}
+.pin:hover path,.pin.act path{fill:rgba(255,122,26,.65)}
+.list{display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:12px}
+.ph{border-radius:10px;overflow:hidden;background:#eee;cursor:pointer;border:2px solid transparent}.ph.act{border-color:#ff7a1a}
+.ph .img{aspect-ratio:4/3;background:#ddd center/cover;display:flex;align-items:center;justify-content:center;color:#888;font-size:12px;text-align:center;padding:6px}
+.ph div.c{padding:6px 8px;font-size:13px}.ph b{color:#ff7a1a;margin-right:4px}
+#orig{margin-top:12px}#orig img{max-width:100%;border-radius:8px}
+#modal{position:fixed;inset:0;background:rgba(0,0,0,.85);display:none;align-items:center;justify-content:center;flex-direction:column;gap:12px;z-index:9}#modal.show{display:flex}
+#modal img{max-width:94vw;max-height:78vh;border-radius:8px}#modal .row{display:flex;gap:10px;color:#fff;align-items:center;flex-wrap:wrap;justify-content:center}
+#modal a,#modal button{background:#ff7a1a;color:#fff;border:0;border-radius:10px;padding:8px 14px;text-decoration:none;font:inherit;cursor:pointer}#modal button{background:#444}
+</style></head><body>
+<header><div><b>Фотографии квартиры на планировке</b><br><small>Точка — место съёмки, сектор — направление камеры. Нажмите, чтобы открыть фото.</small></div><a href="index.html">Открыть 3D-тур</a></header>
+<main>
+  <div class="card"><svg id="plan"></svg><div id="orig"></div></div>
+  <div class="card"><div class="list" id="list"></div></div>
+</main>
+<div id="modal"><img id="mImg" alt=""><div class="row"><span id="mCap"></span><a id="mGo" href="#">Встать на эту точку в 3D</a><button id="mClose">Закрыть</button></div></div>
+<script type="module">
+import { RECTS, POLYS, ROOMS, PHOTOS, PLAN_IMAGE } from './js/data.js';
+const ns='http://www.w3.org/2000/svg', svg=document.getElementById('plan'); svg.setAttribute('viewBox','-0.6 -2.4 12.6 16.4');
+const el=(t,a,p=svg)=>{const e=document.createElementNS(ns,t);for(const k in a)e.setAttribute(k,a[k]);p.appendChild(e);return e;};
+for(const r of RECTS) el('rect',{x:r.x0,y:r.z0,width:r.x1-r.x0,height:r.z1-r.z0,class:'room'+(r.open?' open':'')});
+for(const p of POLYS) el('polygon',{points:p.poly.map(q=>q.join(',')).join(' '),class:'room'});
+for(const [id,r] of Object.entries(ROOMS)){ if(r.area<2) continue; el('text',{x:r.label[0],y:r.label[1]-0.1,class:'rn'}).textContent=r.name.replace(' (застеклённая)','').replace(' (открытый)',''); el('text',{x:r.label[0],y:r.label[1]+0.4,class:'ra'}).textContent=r.area.toFixed(1).replace('.',','); }
+const list=document.getElementById('list');
+PHOTOS.forEach((p,i)=>{
+  const g=el('g',{class:'pin',transform:`translate(${p.x},${p.z}) rotate(${p.dir})`});
+  el('path',{d:'M0,0 L-0.75,-1.5 A1.68,1.68 0 0 1 0.75,-1.5 Z'},g); el('circle',{r:0.24},g);
+  const t=el('text',{y:0.1,transform:`rotate(${-p.dir})`},g); t.textContent=i+1;
+  g.onclick=()=>open(i);
+  const d=document.createElement('div'); d.className='ph'; d.innerHTML=`<div class="img">photos/${p.file}</div><div class="c"><b>${i+1}</b>${p.caption}</div>`;
+  const im=new Image(); im.onload=()=>{d.querySelector('.img').style.backgroundImage=`url(photos/${p.file})`;d.querySelector('.img').textContent='';}; im.src='photos/'+p.file;
+  d.onclick=()=>open(i); d.onmouseenter=()=>g.classList.add('act'); d.onmouseleave=()=>g.classList.remove('act'); list.appendChild(d);
+});
+const oi=new Image(); oi.onload=()=>{document.getElementById('orig').innerHTML='<small>Исходная планировка:</small><br>';document.getElementById('orig').appendChild(oi);}; oi.src=PLAN_IMAGE;
+const m=document.getElementById('modal');
+function open(i){const p=PHOTOS[i];document.getElementById('mImg').src='photos/'+p.file;document.getElementById('mCap').textContent=`${i+1}. ${p.caption}`;document.getElementById('mGo').href=`index.html?view=${p.x},${p.z},${p.dir}`;m.classList.add('show');}
+document.getElementById('mClose').onclick=()=>m.classList.remove('show'); m.onclick=e=>{if(e.target===m)m.classList.remove('show');};
+</script></body></html>

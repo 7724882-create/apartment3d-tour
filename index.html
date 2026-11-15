@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>3D-тур: трёхкомнатная квартира 75,2 м²</title>
+<meta name="description" content="Интерактивная 3D-прогулка по трёхкомнатной квартире 75,2 м²: кухня 10 м², балкон и застеклённая лоджия.">
+<link rel="stylesheet" href="css/style.css">
+<script type="importmap">{"imports":{"three":"./lib/three.module.min.js","three/addons/":"./lib/jsm/"}}</script>
+</head>
+<body data-mode="walk">
+<div id="app"></div>
+<div id="labels"></div>
+
+<header id="top">
+  <div id="title"><b>3-комнатная квартира · 75,2 м²</b><span>жилая 44,8 м² · кухня 10,0 м² · балкон + лоджия</span></div>
+  <div id="roomName">Квартира 75,2 м²</div>
+</header>
+
+<nav id="bar">
+  <button id="btnMode">🏠 Обзор сверху</button>
+  <button id="btnPhotos" style="display:none">📷 Фото комнаты</button>
+  <button id="btnAllPhotos">🖼 Все фото</button>
+  <a class="btn" href="plan.html" target="_blank">🗺 Фото на плане</a>
+  <button id="btnLayer" title="Когда вы стоите на точке, откуда сделано фото, поверх модели показывается сама фотография">📸 Фото-слой</button>
+  <button id="btnHQ" title="Мягкие тени в углах (выключите на слабом компьютере)">✨ Качество</button>
+  <button id="btnFull" title="Во весь экран">⛶</button>
+  <button id="btnHelp" title="Управление">?</button>
+</nav>
+
+<div id="minimap" title="Нажмите на комнату, чтобы перейти в неё"><svg></svg><div class="cap">План · нажмите на комнату</div></div>
+
+<div id="joy"><i></i></div>
+
+<div id="help">
+  <h3>Как перемещаться</h3>
+  <p class="desk"><kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> или стрелки — идти · <kbd>Shift</kbd> — быстрее</p>
+  <p class="desk">Зажмите левую кнопку мыши и ведите — осмотреться · двойной клик по полу — перейти туда · колесо — приблизить</p>
+  <p class="mob">Джойстик слева внизу — идти · проведите пальцем по экрану — осмотреться · двойной тап по полу — перейти</p>
+  <p>📸 Фото-слой: встаньте на точку съёмки (кнопка в галерее «Встать на точку съёмки») — модель плавно сменится настоящей фотографией.</p>
+  <p>Мини-карта справа — быстрый переход в любую комнату. «Обзор сверху» — вся квартира без потолка.</p>
+  <small>Нажмите, чтобы закрыть</small>
+</div>
+
+<div id="gallery">
+  <div class="box">
+    <img id="gImg" alt="">
+    <div id="gPh"></div>
+    <div class="ctl"><button id="gPrev">‹</button><span id="gCap"></span><button id="gNext">›</button></div>
+    <button id="gGo">Встать на точку съёмки в 3D</button>
+    <button id="gClose">✕</button>
+  </div>
+</div>
+
+<div id="loader"><div><b>Загружаем 3D-тур…</b><div id="loadbar"><i></i></div><small>Модель создана по планировке и фотографиям квартиры</small></div></div>
+<noscript>Для просмотра 3D-тура включите JavaScript.</noscript>
+<script type="module" src="js/main.js"></script>
+</body>
+</html>
